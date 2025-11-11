@@ -47,13 +47,33 @@ class TypeScriptLanguageServer(SolidLanguageServer):
     ):
         """
         Creates a TypeScriptLanguageServer instance. This class is not meant to be instantiated directly. Use LanguageServer.create() instead.
+        
+        You can configure Node.js max memory via ls_specific_settings["typescript"]["node_max_memory_mb"].
+        Default is 4096 MB (4GB). Example:
+        
+        ls_specific_settings = {
+            "typescript": {
+                "node_max_memory_mb": 8192  # 8GB for very large projects
+            }
+        }
         """
         ts_lsp_executable_path = self._setup_runtime_dependencies(logger, config, solidlsp_settings)
+        
+        # Get Node.js max memory setting (default 4096 MB = 4GB)
+        ts_settings = solidlsp_settings.ls_specific_settings.get(Language.TYPESCRIPT, {})
+        node_max_memory_mb = ts_settings.get("node_max_memory_mb", 4096)
+        
+        # Build command with Node.js memory limit
+        # Use NODE_OPTIONS environment variable approach for better compatibility
+        node_cmd = ["node", f"--max-old-space-size={node_max_memory_mb}"] + ts_lsp_executable_path + ["--stdio"]
+        
+        logger.log(f"Starting TypeScript LS with Node.js max memory: {node_max_memory_mb}MB", logging.INFO)
+        
         super().__init__(
             config,
             logger,
             repository_root_path,
-            ProcessLaunchInfo(cmd=ts_lsp_executable_path, cwd=repository_root_path),
+            ProcessLaunchInfo(cmd=node_cmd, cwd=repository_root_path),
             "typescript",
             solidlsp_settings,
         )
@@ -130,7 +150,8 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             raise FileNotFoundError(
                 f"typescript-language-server executable not found at {tsserver_executable_path}, something went wrong with the installation."
             )
-        return [tsserver_executable_path, "--stdio"]
+        # Return only the executable path, --stdio and memory options will be added in __init__
+        return [tsserver_executable_path]
 
     @staticmethod
     def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:

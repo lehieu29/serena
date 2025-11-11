@@ -444,29 +444,118 @@ class ProjectCommands(AutoRegisteringGroup):
         default="WARNING",
         help="Log level for indexing.",
     )
-    @click.option("--timeout", type=float, default=10, help="Timeout for indexing a single file.")
-    def index(project: str, log_level: str, timeout: float) -> None:
-        ProjectCommands._index_project(project, log_level, timeout=timeout)
+    @click.option(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Base timeout for indexing a single file. If not set, uses dynamic timeout based on file size.",
+    )
+    @click.option(
+        "--base-timeout",
+        type=float,
+        default=20,
+        help="Base timeout in seconds for small files (used with dynamic timeout).",
+    )
+    @click.option(
+        "--timeout-per-1000-lines",
+        type=float,
+        default=10,
+        help="Additional timeout in seconds per 1000 lines of code (used with dynamic timeout).",
+    )
+    @click.option(
+        "--restart-ls-after-n-files",
+        type=int,
+        default=50,
+        help="Restart language server after processing N files to prevent memory leaks. Set to 0 to disable.",
+    )
+    def index(
+        project: str,
+        log_level: str,
+        timeout: float | None,
+        base_timeout: float,
+        timeout_per_1000_lines: float,
+        restart_ls_after_n_files: int,
+    ) -> None:
+        ProjectCommands._index_project(
+            project,
+            log_level,
+            timeout=timeout,
+            base_timeout=base_timeout,
+            timeout_per_1000_lines=timeout_per_1000_lines,
+            restart_ls_after_n_files=restart_ls_after_n_files,
+        )
 
     @staticmethod
     @click.command("index-deprecated", help="Deprecated alias for 'serena project index'.")
     @click.argument("project", type=click.Path(exists=True), default=os.getcwd(), required=False)
     @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]), default="WARNING")
-    @click.option("--timeout", type=float, default=10, help="Timeout for indexing a single file.")
-    def index_deprecated(project: str, log_level: str, timeout: float) -> None:
+    @click.option("--timeout", type=float, default=None, help="Timeout for indexing a single file.")
+    @click.option("--base-timeout", type=float, default=20, help="Base timeout for small files.")
+    @click.option("--timeout-per-1000-lines", type=float, default=10, help="Additional timeout per 1000 lines.")
+    @click.option("--restart-ls-after-n-files", type=int, default=50, help="Restart LS after N files.")
+    def index_deprecated(
+        project: str,
+        log_level: str,
+        timeout: float | None,
+        base_timeout: float,
+        timeout_per_1000_lines: float,
+        restart_ls_after_n_files: int,
+    ) -> None:
         click.echo("Deprecated! Use `serena project index` instead.")
-        ProjectCommands._index_project(project, log_level, timeout=timeout)
+        ProjectCommands._index_project(
+            project,
+            log_level,
+            timeout=timeout,
+            base_timeout=base_timeout,
+            timeout_per_1000_lines=timeout_per_1000_lines,
+            restart_ls_after_n_files=restart_ls_after_n_files,
+        )
 
     @staticmethod
-    def _index_project(project: str, log_level: str, timeout: float) -> None:
+    def _calculate_dynamic_timeout(
+        file_path: str, project_root: str, base_timeout: float, timeout_per_1000_lines: float
+    ) -> float:
+        """Calculate dynamic timeout based on file size (number of lines)."""
+        try:
+            full_path = os.path.join(project_root, file_path)
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                line_count = sum(1 for _ in f)
+            # Calculate: base_timeout + (lines / 1000) * timeout_per_1000_lines
+            dynamic_timeout = base_timeout + (line_count / 1000.0) * timeout_per_1000_lines
+            return dynamic_timeout
+        except Exception:
+            # If we can't read the file, use base timeout
+            return base_timeout
+
+    @staticmethod
+    def _index_project(
+        project: str,
+        log_level: str,
+        timeout: float | None = None,
+        base_timeout: float = 20,
+        timeout_per_1000_lines: float = 10,
+        restart_ls_after_n_files: int = 50,
+    ) -> None:
         lvl = logging.getLevelNamesMapping()[log_level.upper()]
         logging.configure(level=lvl)
         serena_config = SerenaConfig.from_config_file()
         proj = Project.load(os.path.abspath(project))
-        click.echo(f"Indexing symbols in project {project} …")
+        
+        use_dynamic_timeout = timeout is None
+        if use_dynamic_timeout:
+            click.echo(f"Using dynamic timeout: base={base_timeout}s + {timeout_per_1000_lines}s per 1000 lines")
+        else:
+            click.echo(f"Using fixed timeout: {timeout}s per file")
+        
+        if restart_ls_after_n_files > 0:
+            click.echo(f"Language server will restart after every {restart_ls_after_n_files} files")
+        
+        # Initial timeout for LS creation
+        initial_ls_timeout = timeout if timeout else 120
         ls_mgr = proj.create_language_server_manager(
-            log_level=lvl, ls_timeout=timeout, ls_specific_settings=serena_config.ls_specific_settings
+            log_level=lvl, ls_timeout=initial_ls_timeout, ls_specific_settings=serena_config.ls_specific_settings
         )
+        
         try:
             log_file = os.path.join(project, ".serena", "logs", "indexing.txt")
             click.echo(f"Error logs will be saved to: {log_file}")
@@ -479,21 +568,68 @@ class ProjectCommands(AutoRegisteringGroup):
                 collected_exceptions: list[Exception] = []
                 collected_tracebacks: list[str] = []
                 files_failed = []
+                files_with_timeout: list[tuple[str, float]] = []  # Track (file, timeout_used)
+                
                 for i, f in enumerate(tqdm(files, desc="Indexing")):
+                    # Calculate timeout for this specific file
+                    if use_dynamic_timeout:
+                        file_timeout = ProjectCommands._calculate_dynamic_timeout(
+                            f, project, base_timeout, timeout_per_1000_lines
+                        )
+                    else:
+                        file_timeout = timeout
+                    
+                    # Temporarily update LS timeout for this file
+                    original_timeout = ls.server.request_timeout
+                    ls.server.request_timeout = file_timeout
+                    
                     try:
                         ls.request_document_symbols(f, include_body=False)
                         ls.request_document_symbols(f, include_body=True)
+                        
+                        # Track timeout used for successful large files (for logging)
+                        if use_dynamic_timeout and file_timeout > base_timeout * 2:
+                            files_with_timeout.append((f, file_timeout))
+                            
                     except Exception as e:
                         tb = traceback.format_exc()
-                        log.error(f"Failed to index {f}: {type(e).__name__}: {e}")
+                        error_msg = f"Failed to index {f}: {type(e).__name__}: {e}"
+                        if use_dynamic_timeout:
+                            error_msg += f" (timeout used: {file_timeout:.1f}s)"
+                        log.error(error_msg)
                         log.debug(f"Traceback for {f}:\n{tb}")
                         collected_exceptions.append(e)
                         collected_tracebacks.append(tb)
                         files_failed.append(f)
+                    finally:
+                        # Restore original timeout
+                        ls.server.request_timeout = original_timeout
+                    
+                    # Save cache periodically
                     if (i + 1) % 10 == 0:
                         ls.save_cache()
+                    
+                    # Restart LS after N files to prevent memory leaks
+                    if restart_ls_after_n_files > 0 and (i + 1) % restart_ls_after_n_files == 0 and (i + 1) < len(files):
+                        click.echo(f"\n🔄 Restarting language server after {i + 1} files to free memory...")
+                        ls.save_cache()
+                        try:
+                            ls = ls_mgr.restart_language_server(ls.language)
+                            click.echo("✓ Language server restarted successfully")
+                        except Exception as restart_error:
+                            log.error(f"Failed to restart language server: {restart_error}")
+                            click.echo(f"⚠️  Warning: Could not restart LS, continuing with current instance")
+                
                 ls.save_cache()
                 click.echo(f"Symbols saved to {ls.cache_path}")
+                
+                # Report on large files that were processed
+                if files_with_timeout:
+                    click.echo(f"\n📊 Processed {len(files_with_timeout)} large files with extended timeout:")
+                    for file, timeout_used in files_with_timeout[:5]:  # Show first 5
+                        click.echo(f"  • {file} (timeout: {timeout_used:.1f}s)")
+                    if len(files_with_timeout) > 5:
+                        click.echo(f"  ... and {len(files_with_timeout) - 5} more")
 
             if len(files_failed) > 0:
                 os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -501,6 +637,10 @@ class ProjectCommands(AutoRegisteringGroup):
                     f.write(f"=== Indexing Error Log ===")
                     f.write(f"\nProject: {project}")
                     f.write(f"\nTotal files failed: {len(files_failed)}")
+                    if use_dynamic_timeout:
+                        f.write(f"\nDynamic timeout: base={base_timeout}s + {timeout_per_1000_lines}s per 1000 lines")
+                    else:
+                        f.write(f"\nFixed timeout: {timeout}s")
                     f.write(f"\n{'='*80}\n\n")
                     for file, exception, tb in zip(files_failed, collected_exceptions, collected_tracebacks, strict=True):
                         f.write(f"{'='*80}\n")
@@ -510,6 +650,8 @@ class ProjectCommands(AutoRegisteringGroup):
                         f.write(f"\nFull Traceback:\n{tb}\n")
                 click.echo(f"\n⚠️  Failed to index {len(files_failed)} files. See detailed error log:\n{log_file}")
                 click.echo(f"\nTip: Run with --log-level DEBUG for more verbose output during indexing.")
+                if use_dynamic_timeout:
+                    click.echo(f"Tip: If many large files timeout, increase --base-timeout or --timeout-per-1000-lines")
         finally:
             ls_mgr.stop_all()
 
