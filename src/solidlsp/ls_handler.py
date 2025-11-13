@@ -170,6 +170,26 @@ class SolidLanguageServerHandler:
         """
         self._request_timeout = timeout
 
+    @property
+    def request_timeout(self) -> float | None:
+        """
+        Get the request timeout value.
+        
+        Returns:
+            The timeout in seconds, or None if no timeout is set.
+        """
+        return self._request_timeout
+
+    @request_timeout.setter
+    def request_timeout(self, timeout: float | None) -> None:
+        """
+        Set the request timeout value.
+        
+        Args:
+            timeout: The timeout in seconds, or None to disable timeout.
+        """
+        self._request_timeout = timeout
+
     def is_running(self) -> bool:
         """
         Checks if the language server process is currently running.
@@ -186,10 +206,15 @@ class SolidLanguageServerHandler:
 
         cmd = self.process_launch_info.cmd
         is_windows = platform.system() == "Windows"
-        if not isinstance(cmd, str) and not is_windows:
-            # Since we are using the shell, we need to convert the command list to a single string
-            # on Linux/macOS
-            cmd = " ".join(cmd)
+        
+        # Convert command list to string for shell execution
+        if not isinstance(cmd, str):
+            if is_windows:
+                # Windows: use subprocess.list2cmdline to handle paths with spaces
+                cmd = subprocess.list2cmdline(cmd)
+            else:
+                # Unix: use space join (simple approach)
+                cmd = " ".join(cmd)
         log.info("Starting language server process via command: %s", self.process_launch_info.cmd)
         kwargs = subprocess_kwargs()
         kwargs["start_new_session"] = self.start_independent_lsp_process

@@ -5,6 +5,7 @@ Provides TypeScript specific instantiation of the LanguageServer class. Contains
 import logging
 import os
 import pathlib
+import platform
 import shutil
 import threading
 
@@ -63,17 +64,26 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         ts_settings = solidlsp_settings.ls_specific_settings.get(Language.TYPESCRIPT, {})
         node_max_memory_mb = ts_settings.get("node_max_memory_mb", 4096)
         
-        # Build command with Node.js memory limit
-        # Use NODE_OPTIONS environment variable approach for better compatibility
-        node_cmd = ["node", f"--max-old-space-size={node_max_memory_mb}"] + ts_lsp_executable_path + ["--stdio"]
+        # Detect platform and build appropriate command
+        is_windows = platform.system() == "Windows"
+        launch_env = {}
         
-        logger.log(f"Starting TypeScript LS with Node.js max memory: {node_max_memory_mb}MB", logging.INFO)
+        if is_windows:
+            # Windows: Run .cmd file directly (it's a wrapper that calls node internally)
+            # Use NODE_OPTIONS environment variable for memory limit
+            node_cmd = ts_lsp_executable_path + ["--stdio"]
+            launch_env["NODE_OPTIONS"] = f"--max-old-space-size={node_max_memory_mb}"
+            logger.log(f"Starting TypeScript LS on Windows with NODE_OPTIONS for max memory: {node_max_memory_mb}MB", logging.INFO)
+        else:
+            # Unix: Use node command directly as before
+            node_cmd = ["node", f"--max-old-space-size={node_max_memory_mb}"] + ts_lsp_executable_path + ["--stdio"]
+            logger.log(f"Starting TypeScript LS on Unix with Node.js max memory: {node_max_memory_mb}MB", logging.INFO)
         
         super().__init__(
             config,
             logger,
             repository_root_path,
-            ProcessLaunchInfo(cmd=node_cmd, cwd=repository_root_path),
+            ProcessLaunchInfo(cmd=node_cmd, cwd=repository_root_path, env=launch_env),
             "typescript",
             solidlsp_settings,
         )
@@ -140,7 +150,18 @@ class TypeScriptLanguageServer(SolidLanguageServer):
 
         # Install typescript and typescript-language-server if not already installed
         tsserver_ls_dir = os.path.join(cls.ls_resources_dir(solidlsp_settings), "ts-lsp")
-        tsserver_executable_path = os.path.join(tsserver_ls_dir, "node_modules", ".bin", "typescript-language-server")
+        
+        # Detect platform and choose correct executable
+        is_windows = platform.system() == "Windows"
+        if is_windows:
+            # Windows uses .cmd wrapper scripts
+            executable_name = "typescript-language-server.cmd"
+        else:
+            # Unix uses shell scripts without extension
+            executable_name = "typescript-language-server"
+            
+        tsserver_executable_path = os.path.join(tsserver_ls_dir, "node_modules", ".bin", executable_name)
+        
         if not os.path.exists(tsserver_executable_path):
             logger.log(f"Typescript Language Server executable not found at {tsserver_executable_path}. Installing...", logging.INFO)
             with LogTime("Installation of TypeScript language server dependencies", logger=logger.logger):
@@ -150,7 +171,8 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             raise FileNotFoundError(
                 f"typescript-language-server executable not found at {tsserver_executable_path}, something went wrong with the installation."
             )
-        # Return only the executable path, --stdio and memory options will be added in __init__
+        
+        logger.log(f"Found TypeScript LS executable: {tsserver_executable_path}", logging.INFO)
         return [tsserver_executable_path]
 
     @staticmethod
