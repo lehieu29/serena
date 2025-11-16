@@ -1,0 +1,39 @@
+Indexing for language typescript (1/1) ...
+
+Indexing:      1%│                       │ 29/4661 [00:03<10:56, 7.06it/s]
+
+→ Restarting language server after 30 files to free memory…
+    Time: 2025-11-16 09:42:44 │ RAM: 27.0% (4.32GB / 16.00GB) │ CPU: 33.3%
+✔ Language server restarted successfully
+
+Indexing:      1%│                       │ 59/4661 [00:17<09:40, 7.93it/s]
+
+→ Restarting language server after 60 files to free memory…
+    Time: 2025-11-16 09:42:58 │ RAM: 53.6% (5.37GB / 16.00GB) │ CPU: 73.1%
+✔ Language server restarted successfully
+
+Indexing:      2%│                       │ 88/4661 [00:26<07:34, 10.05it/s]
+
+→ Restarting language server after 90 files to free memory…
+    Time: 2025-11-16 09:43:06 │ RAM: 58.4% (6.15GB / 16.00GB) │ CPU: 75.0%
+✔ Language server restarted successfully
+
+Indexing:      3%│                       │ 118/4661 [00:43<21:59, 3.44it/s]
+
+→ Restarting language server after 120 files to free memory…
+    Time: 2025-11-16 09:43:23 │ RAM: 51.9% (8.31GB / 16.00GB) │ CPU: 100.0%
+✔ Language server restarted successfully
+
+Indexing:      3%│                       │ 149/4661 [01:39<9:16:19, 7.40s/it]
+
+→ Restarting language server after 150 files to free memory…
+    Time: 2025-11-16 09:44:19 │ RAM: 87.3% (14.05GB / 16.00GB) │ CPU: 100.0%
+✔ Language server restarted successfully
+
+Indexing:      4%│                       │ 178/4661 [02:38<1:26:51, 1.16s/it]
+
+→ Restarting language server after 180 files to free memory…
+    Time: 2025-11-16 09:45:19 │ RAM: 95.1% (15.21GB / 16.00GB) │ CPU: 100.0%
+✔ Language server restarted successfully
+
+Indexing:      4%│                       │ 180/4661 [02:43<2:12:12, 1.77s/it]

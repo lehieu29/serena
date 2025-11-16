@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from queue import Empty, Queue
 from typing import Any
 
@@ -231,7 +232,10 @@ class SolidLanguageServerHandler:
 
         # Check if process terminated immediately
         if self.process.returncode is not None:
-            log.error("Language server has already terminated/could not be started")
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            mem = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            log.error(f"Language server has already terminated/could not be started | Time: {current_time}, RAM: {mem.percent:.1f}% ({mem.used / (1024**3):.2f}GB / {mem.total / (1024**3):.2f}GB), CPU: {cpu_percent:.1f}%")
             # Process has already terminated
             stderr_data = self.process.stderr.read()
             error_message = stderr_data.decode("utf-8", errors="replace")
@@ -394,7 +398,11 @@ class SolidLanguageServerHandler:
         if not self._is_shutting_down:
             if exception is None:
                 exception = LanguageServerTerminatedException("Language server stdout read process terminated unexpectedly", self.language)
-            log.error(str(exception))
+            # Log resource usage at time of crash
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            mem = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            log.error(f"{exception} | Time: {current_time}, RAM: {mem.percent:.1f}% ({mem.used / (1024**3):.2f}GB / {mem.total / (1024**3):.2f}GB), CPU: {cpu_percent:.1f}%")
             self._cancel_pending_requests(exception)
 
     def _read_ls_process_stderr(self) -> None:
@@ -419,7 +427,11 @@ class SolidLanguageServerHandler:
         except Exception as e:
             log.error("Error while reading stderr from language server process: %s", e, exc_info=e)
         if not self._is_shutting_down:
-            log.error("Language server stderr reader thread terminated unexpectedly")
+            # Log resource usage at time of crash
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            mem = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            log.error(f"Language server stderr reader thread terminated unexpectedly | Time: {current_time}, RAM: {mem.percent:.1f}% ({mem.used / (1024**3):.2f}GB / {mem.total / (1024**3):.2f}GB), CPU: {cpu_percent:.1f}%")
         else:
             log.info("Language server stderr reader thread has terminated")
 

@@ -1,13 +1,18 @@
+import gc
 import glob
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 import traceback
+from datetime import datetime
 from logging import Logger
 from pathlib import Path
 from typing import Any, Literal
+
+import psutil
 
 import click
 from sensai.util import logging
@@ -468,6 +473,18 @@ class ProjectCommands(AutoRegisteringGroup):
         default=50,
         help="Restart language server after processing N files to prevent memory leaks. Set to 0 to disable.",
     )
+    @click.option(
+        "--skip-body",
+        is_flag=True,
+        default=False,
+        help="Skip requesting symbol bodies to reduce memory usage by ~50%. Recommended for large projects.",
+    )
+    @click.option(
+        "--save-cache-every",
+        type=int,
+        default=10,
+        help="Save cache to disk every N files. Lower values reduce RAM usage but increase disk I/O.",
+    )
     def index(
         project: str,
         log_level: str,
@@ -475,6 +492,8 @@ class ProjectCommands(AutoRegisteringGroup):
         base_timeout: float,
         timeout_per_1000_lines: float,
         restart_ls_after_n_files: int,
+        skip_body: bool,
+        save_cache_every: int,
     ) -> None:
         ProjectCommands._index_project(
             project,
@@ -483,6 +502,8 @@ class ProjectCommands(AutoRegisteringGroup):
             base_timeout=base_timeout,
             timeout_per_1000_lines=timeout_per_1000_lines,
             restart_ls_after_n_files=restart_ls_after_n_files,
+            skip_body=skip_body,
+            save_cache_every=save_cache_every,
         )
 
     @staticmethod
@@ -535,6 +556,8 @@ class ProjectCommands(AutoRegisteringGroup):
         base_timeout: float = 20,
         timeout_per_1000_lines: float = 10,
         restart_ls_after_n_files: int = 50,
+        skip_body: bool = False,
+        save_cache_every: int = 10,
     ) -> None:
         lvl = logging.getLevelNamesMapping()[log_level.upper()]
         logging.configure(level=lvl)
@@ -549,6 +572,11 @@ class ProjectCommands(AutoRegisteringGroup):
         
         if restart_ls_after_n_files > 0:
             click.echo(f"Language server will restart after every {restart_ls_after_n_files} files")
+        
+        if skip_body:
+            click.echo("Skipping symbol body requests (memory-optimized mode)")
+        
+        click.echo(f"Cache will be saved to disk every {save_cache_every} files")
         
         # Initial timeout for LS creation
         initial_ls_timeout = timeout if timeout else 120
@@ -565,12 +593,50 @@ class ProjectCommands(AutoRegisteringGroup):
             servers = list(ls_mgr.iter_language_servers())
             for k, ls in enumerate(servers, start=1):
                 click.echo(f"Indexing for language {ls.language.value} ({k}/{len(servers)}) …")
+                
+                # TypeScript-specific optimization: More aggressive restart
+                effective_restart_interval = restart_ls_after_n_files
+                if ls.language.value.lower() in ['typescript', 'javascript']:
+                    effective_restart_interval = max(10, restart_ls_after_n_files // 2)
+                    click.echo(f"⚡ TypeScript/JavaScript detected: Using aggressive restart interval ({effective_restart_interval} files)")
+                    click.echo(f"   (TypeScript Language Server is known for memory leaks)")
+                
                 collected_exceptions: list[Exception] = []
                 collected_tracebacks: list[str] = []
                 files_failed = []
                 files_with_timeout: list[tuple[str, float]] = []  # Track (file, timeout_used)
+                memory_samples = []  # Track (file_index, ram_percent, ram_gb)
                 
                 for i, f in enumerate(tqdm(files, desc="Indexing")):
+                    # Phase 2.2: Memory threshold check - Force restart if RAM > 85%
+                    current_mem = psutil.virtual_memory()
+                    if current_mem.percent > 85.0 and i > 0:
+                        click.echo(f"\n⚠️  EMERGENCY: High memory usage detected ({current_mem.percent:.1f}%)")
+                        click.echo(f"   Forcing immediate restart at file {i + 1} to prevent OOM...")
+                        
+                        # Emergency save and restart
+                        click.echo(f"\n💾 Emergency cache save...")
+                        click.echo(f"   Cache has changed: {ls._cache_has_changed}")
+                        click.echo(f"   Cache entries: {len(ls._document_symbols_cache)}")
+                        ls.save_cache()
+                        if ls.cache_path.exists():
+                            click.echo(f"   ✓ Cache saved: {ls.cache_path.stat().st_size / 1024:.2f} KB")
+                        else:
+                            click.echo(f"   ❌ WARNING: Cache file NOT created!")
+                        old_cache_size = len(ls._document_symbols_cache)
+                        ls._document_symbols_cache.clear()
+                        gc.collect()
+                        time.sleep(1)
+                        
+                        try:
+                            ls = ls_mgr.restart_language_server(ls.language)
+                            click.echo(f"✓ Emergency restart completed (cleared {old_cache_size} cache entries)")
+                        except Exception as e:
+                            log.error(f"Emergency restart failed: {e}")
+                            click.echo(f"⚠️  Emergency restart failed, continuing...")
+                        
+                        time.sleep(2)  # Cool-down
+                        gc.collect()
                     # Calculate timeout for this specific file
                     if use_dynamic_timeout:
                         file_timeout = ProjectCommands._calculate_dynamic_timeout(
@@ -585,7 +651,8 @@ class ProjectCommands(AutoRegisteringGroup):
                     
                     try:
                         ls.request_document_symbols(f, include_body=False)
-                        ls.request_document_symbols(f, include_body=True)
+                        if not skip_body:
+                            ls.request_document_symbols(f, include_body=True)
                         
                         # Track timeout used for successful large files (for logging)
                         if use_dynamic_timeout and file_timeout > base_timeout * 2:
@@ -606,22 +673,90 @@ class ProjectCommands(AutoRegisteringGroup):
                         ls.server.request_timeout = original_timeout
                     
                     # Save cache periodically
-                    if (i + 1) % 10 == 0:
+                    if (i + 1) % save_cache_every == 0:
+                        click.echo(f"\n💾 Periodic cache save @ file {i + 1}...")
+                        click.echo(f"   Cache has changed: {ls._cache_has_changed}")
+                        click.echo(f"   Cache entries: {len(ls._document_symbols_cache)}")
+                        click.echo(f"   Cache path: {ls.cache_path}")
                         ls.save_cache()
+                        if ls.cache_path.exists():
+                            click.echo(f"   ✓ Cache file saved: {ls.cache_path.stat().st_size / 1024:.2f} KB")
+                        else:
+                            click.echo(f"   ❌ WARNING: Cache file NOT created!")
                     
                     # Restart LS after N files to prevent memory leaks
-                    if restart_ls_after_n_files > 0 and (i + 1) % restart_ls_after_n_files == 0 and (i + 1) < len(files):
+                    if effective_restart_interval > 0 and (i + 1) % effective_restart_interval == 0 and (i + 1) < len(files):
+                        # Get system resource usage BEFORE restart
+                        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        mem_before = psutil.virtual_memory()
+                        cpu_percent = psutil.cpu_percent(interval=0.1)
+                        
                         click.echo(f"\n🔄 Restarting language server after {i + 1} files to free memory...")
+                        click.echo(f"   Time: {current_time} | RAM: {mem_before.percent:.1f}% ({mem_before.used / (1024**3):.2f}GB / {mem_before.total / (1024**3):.2f}GB) | CPU: {cpu_percent:.1f}%")
+                        log.info(f"LS restart triggered - Time: {current_time}, RAM: {mem_before.percent:.1f}%, CPU: {cpu_percent:.1f}%")
+                        
+                        # Track memory before cleanup
+                        memory_samples.append((i + 1, mem_before.percent, mem_before.used / (1024**3)))
+                        
+                        click.echo(f"\n💾 Pre-restart cache save...")
+                        click.echo(f"   Cache has changed: {ls._cache_has_changed}")
+                        click.echo(f"   Cache entries: {len(ls._document_symbols_cache)}")
                         ls.save_cache()
+                        if ls.cache_path.exists():
+                            click.echo(f"   ✓ Cache saved: {ls.cache_path.stat().st_size / 1024:.2f} KB")
+                        else:
+                            click.echo(f"   ❌ WARNING: Cache file NOT created!")
+                        
+                        # Phase 2.1: Clear cache + Force GC
+                        old_cache_size = len(ls._document_symbols_cache)
+                        ls._document_symbols_cache.clear()
+                        click.echo(f"   Cleared {old_cache_size} entries from in-memory cache")
+                        
+                        # Force immediate garbage collection
+                        click.echo(f"   Forcing garbage collection...")
+                        collected = gc.collect()
+                        log.debug(f"GC collected {collected} objects")
+                        
+                        # Phase 2.5: Cool-down before restart
+                        time.sleep(0.5)  # Give OS time to reclaim memory
+                        
                         try:
                             ls = ls_mgr.restart_language_server(ls.language)
+                            
+                            # Phase 2.5: Cool-down after restart
+                            time.sleep(2.0)  # Let LS initialize properly
+                            gc.collect()  # One more GC after restart
+                            
+                            # Measure memory AFTER restart
+                            mem_after = psutil.virtual_memory()
+                            mem_freed = mem_before.used - mem_after.used
+                            mem_freed_gb = mem_freed / (1024**3)
+                            
                             click.echo("✓ Language server restarted successfully")
+                            if mem_freed_gb > 0:
+                                click.echo(f"   Memory freed: {mem_freed_gb:.2f}GB (was {mem_before.percent:.1f}%, now {mem_after.percent:.1f}%)")
+                            else:
+                                click.echo(f"   Memory after restart: {mem_after.percent:.1f}% ({mem_after.used / (1024**3):.2f}GB)")
+                                if mem_after.percent > mem_before.percent:
+                                    click.echo(f"   ⚠️  Warning: Memory increased after restart (possible system load)")
+                            
+                            log.info(f"LS restart completed - RAM: {mem_after.percent:.1f}%, freed: {mem_freed_gb:.2f}GB")
+                            
                         except Exception as restart_error:
                             log.error(f"Failed to restart language server: {restart_error}")
                             click.echo(f"⚠️  Warning: Could not restart LS, continuing with current instance")
                 
+                click.echo(f"\n💾 Final cache save...")
+                click.echo(f"   Cache has changed: {ls._cache_has_changed}")
+                click.echo(f"   Cache entries: {len(ls._document_symbols_cache)}")
                 ls.save_cache()
-                click.echo(f"Symbols saved to {ls.cache_path}")
+                if ls.cache_path.exists():
+                    click.echo(f"\n✓ Symbols saved to {ls.cache_path}")
+                    click.echo(f"   File size: {ls.cache_path.stat().st_size / (1024**2):.2f} MB")
+                else:
+                    click.echo(f"\n❌ WARNING: Cache file does NOT exist at {ls.cache_path}!")
+                    click.echo(f"   This means cache was never written to disk.")
+                    click.echo(f"   Check logs for 'Failed to save' errors.")
                 
                 # Report on large files that were processed
                 if files_with_timeout:
@@ -630,6 +765,47 @@ class ProjectCommands(AutoRegisteringGroup):
                         click.echo(f"  • {file} (timeout: {timeout_used:.1f}s)")
                     if len(files_with_timeout) > 5:
                         click.echo(f"  ... and {len(files_with_timeout) - 5} more")
+                
+                # Phase 3.1: Memory profiling summary
+                if memory_samples:
+                    click.echo(f"\n📈 Memory Usage Summary:")
+                    click.echo(f"   Total restarts: {len(memory_samples)}")
+                    
+                    # Calculate statistics
+                    ram_percentages = [sample[1] for sample in memory_samples]
+                    ram_gbs = [sample[2] for sample in memory_samples]
+                    
+                    avg_ram_pct = sum(ram_percentages) / len(ram_percentages)
+                    max_ram_pct = max(ram_percentages)
+                    min_ram_pct = min(ram_percentages)
+                    
+                    avg_ram_gb = sum(ram_gbs) / len(ram_gbs)
+                    max_ram_gb = max(ram_gbs)
+                    
+                    click.echo(f"   Average RAM before restart: {avg_ram_pct:.1f}% ({avg_ram_gb:.2f}GB)")
+                    click.echo(f"   Peak RAM before restart: {max_ram_pct:.1f}% ({max_ram_gb:.2f}GB)")
+                    click.echo(f"   Min RAM before restart: {min_ram_pct:.1f}%")
+                    
+                    # Check if memory is trending upward (potential leak)
+                    if len(memory_samples) >= 3:
+                        first_half_avg = sum(ram_gbs[:len(ram_gbs)//2]) / (len(ram_gbs)//2)
+                        second_half_avg = sum(ram_gbs[len(ram_gbs)//2:]) / (len(ram_gbs) - len(ram_gbs)//2)
+                        trend = second_half_avg - first_half_avg
+                        
+                        if trend > 1.0:  # More than 1GB increase
+                            click.echo(f"   ⚠️  Warning: Memory trend increasing (+{trend:.2f}GB from first to second half)")
+                            click.echo(f"      Consider using more aggressive restart interval")
+                        elif trend < -0.5:  # Decreasing
+                            click.echo(f"   ✅ Memory trend stable/decreasing ({trend:.2f}GB)")
+                        else:
+                            click.echo(f"   ✅ Memory trend stable")
+                    
+                    # Show memory progression
+                    click.echo(f"\n   Memory progression (before each restart):")
+                    for idx, (file_idx, ram_pct, ram_gb) in enumerate(memory_samples[:10]):  # Show first 10
+                        click.echo(f"     #{idx+1} @ file {file_idx}: {ram_pct:.1f}% ({ram_gb:.2f}GB)")
+                    if len(memory_samples) > 10:
+                        click.echo(f"     ... and {len(memory_samples) - 10} more restarts")
 
             if len(files_failed) > 0:
                 os.makedirs(os.path.dirname(log_file), exist_ok=True)
